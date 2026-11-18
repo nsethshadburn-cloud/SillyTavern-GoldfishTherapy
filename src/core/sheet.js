@@ -61,7 +61,7 @@ export function renderSheet(stored, { stale = false } = {}) {
     const sheet = normalizeSheet(stored); // stored sheets may come from an older version
     if (!sheet) return '';
     const lines = [stale
-        ? '[Scene facts as of just before the newest message. Where the newest message changes one of them, the newest message wins. Everything else still holds.]'
+        ? '[Scene facts as of a moment ago. Where the newest messages change one of them, the newest messages win. Everything else still holds.]'
         : '[Scene facts. These are true right now. Whatever is written next must fit them.]'];
     if (sheet.place) lines.push(`Place: ${sheet.place}`);
     if (sheet.time) lines.push(`Time: ${sheet.time}`);

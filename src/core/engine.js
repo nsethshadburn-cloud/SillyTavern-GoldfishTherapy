@@ -3,6 +3,10 @@
 //
 // A sheet stored on a message is the state of the scene AFTER that message.
 //
+// Nothing happens when a reply arrives. The player may read it, swipe it, edit it or delete it.
+// A reply counts as accepted the moment the player moves on (sends the next message), and only
+// then is it checked, fixed if needed, and counted in the notes and the memory.
+//
 // deps = {
 //   chat():            the live message array
 //   chatId():          changes when the user opens another chat
@@ -26,6 +30,8 @@ import { buildAdvance, buildCheck, buildSummarize } from './prompts.js';
 const CHECK_CONTEXT = 6;
 const ADVANCE_CONTEXT = 4;
 const MAX_CHAPTERS_PER_PASS = 5;
+// More new messages than this at once (a chat opened half way, a failed turn) go straight to Claude.
+const MAX_GATED = 3;
 
 const DECLINED = 'It may have declined this message.';
 
@@ -38,6 +44,7 @@ export class Engine {
         this.deps = deps;
         this.lock = Promise.resolve();
         this.memLock = Promise.resolve();
+        this.fixes = [];
     }
 
     // ---------- per-message data ----------
@@ -55,6 +62,18 @@ export class Engine {
         const d = this.data(message);
         if (!d) return;
         for (const key of keys) delete d[key];
+    }
+
+    /** A reply from the model that has not been looked over yet. */
+    unchecked(message) {
+        return Boolean(message) && !message.is_user && !message.is_system && !this.data(message)?.checked;
+    }
+
+    /** The last message that counts as accepted: a newest reply nobody has moved on from is left out. */
+    acceptedEnd() {
+        const chat = this.deps.chat();
+        const last = chat.length - 1;
+        return last > 0 && this.unchecked(chat[last]) ? last - 1 : last;
     }
 
     /** The newest sheet at or before `index`, or null. */
@@ -102,161 +121,200 @@ export class Engine {
     }
 
     /**
-     * Make sure message `index` carries a sheet, and return it.
-     * One new message goes through the local check first; anything else goes straight to Claude.
+     * Work out what it takes to bring everything up to message `through` into the record.
+     * The cheap part happens here: the local model's one-word checks. Returns { sheet } when that
+     * settled it, or { job } when Claude is needed; job() does the work and returns the sheet.
      */
-    async ensureThrough(index) {
+    async triage(through) {
         const chat = this.deps.chat();
-        if (index < 0 || index >= chat.length) return null;
+        if (through < 0 || through >= chat.length) return { sheet: null };
         const s = this.deps.settings();
-        let known = index;
+        let known = through;
         while (known >= 0 && !this.data(chat[known])?.sheet) known--;
-        if (known === index) return this.data(chat[index]).sheet;
+        if (known === through) return { sheet: this.data(chat[through]).sheet };
         const prev = known >= 0 ? this.data(chat[known]).sheet : null;
-        const pending = this.list(known + 1, index);
-        if (!pending.length) return prev;
+        const pending = this.list(known + 1, through);
+        if (!pending.length) return { sheet: prev };
 
-        if (prev && pending.length === 1 && s.gateMode === 'local') {
-            let changed = true;
-            try {
-                changed = await this.deps.gate(pending[0].index);
-            } catch (error) {
-                console.warn('[Goldfish Therapy] local check failed, asking Claude instead:', reason(error));
+        const replies = pending.filter(m => !m.isUser && this.unchecked(chat[m.index]));
+        const accept = () => { for (const m of replies) this.setData(chat[m.index], { checked: true }); };
+
+        if (!prev) {
+            // No notes yet, so nothing to check a reply against: start the record.
+            return {
+                job: async () => {
+                    const guard = this.guard(through);
+                    this.deps.status('Writing the scene notes…', 'busy');
+                    const sheet = await this.advance(null, Math.max(0, through - s.rebuildWindow + 1), through);
+                    if (guard.gone()) return null;
+                    this.setData(chat[through], { sheet, gate: 'yes' });
+                    accept();
+                    this.deps.status('Scene notes written', 'ok');
+                    return sheet;
+                },
+            };
+        }
+
+        const reply = s.fixReplies ? replies[0] ?? null : null;
+        let check = Boolean(reply);
+        if (s.gateMode === 'local' && pending.length <= MAX_GATED) {
+            const ask = async m => {
+                try {
+                    return await this.deps.gate(m.index);
+                } catch (error) {
+                    console.warn('[Goldfish Therapy] local check failed, asking Claude instead:', reason(error));
+                    return true;
+                }
+            };
+            if (reply) check = await ask(reply);
+            let physical = check;
+            if (!physical) {
+                for (const m of pending) {
+                    if (m === reply) continue;
+                    if (await ask(m)) { physical = true; break; }
+                }
             }
-            if (!changed) {
-                this.setData(chat[index], { sheet: prev, gate: 'no' });
-                return prev;
+            if (!physical) {
+                this.setData(chat[through], { sheet: prev, gate: 'no' });
+                accept();
+                return { sheet: prev };
             }
         }
 
+        return {
+            job: () => (check
+                ? this.checkAndAdvance(prev, known, reply, through, accept)
+                : this.advanceThrough(prev, known, through, accept)),
+        };
+    }
+
+    /** Tells a job that the chat moved on under it while Claude was answering. */
+    guard(through, replyIndex = -1) {
+        const chat = this.deps.chat();
+        const chatId = this.deps.chatId();
+        const target = chat[through];
+        const reply = replyIndex >= 0 ? chat[replyIndex] : null;
+        const text = reply?.mes;
+        const swipe = reply?.swipe_id;
+        return {
+            gone: () => this.deps.chatId() !== chatId || this.deps.chat()[through] !== target
+                || (reply !== null && (this.deps.chat()[replyIndex] !== reply || reply.mes !== text || reply.swipe_id !== swipe)),
+        };
+    }
+
+    async advanceThrough(prev, known, through, accept) {
+        const chat = this.deps.chat();
+        const guard = this.guard(through);
         this.deps.status('Updating the scene notes…', 'busy');
-        const from = prev ? known + 1 : Math.max(0, index - s.rebuildWindow + 1);
-        const sheet = await this.advance(prev, from, index);
-        this.setData(chat[index], { sheet, gate: 'yes' });
+        const sheet = await this.advance(prev, known + 1, through);
+        if (guard.gone()) return null;
+        this.setData(chat[through], { sheet, gate: 'yes' });
+        accept();
         this.deps.status('Scene notes updated', 'ok');
         return sheet;
     }
 
-    // ---------- the two hooks ----------
-
-    /** Runs just before SillyTavern builds the prompt for a reply. */
-    async beforeGenerate(type) {
-        const s = this.deps.settings();
-        if (!s.enabled) {
-            this.deps.inject('', '');
-            return;
-        }
-        if (type === 'quiet' || type === 'impersonate') return;
+    /**
+     * One Claude call: check the accepted reply, fix it if needed, and bring the notes up to date
+     * with it and with whatever followed it (normally the player's new message).
+     */
+    async checkAndAdvance(prev, known, reply, through, accept) {
         const chat = this.deps.chat();
-        const last = chat.length - 1;
-        // A swipe or a continue rewrites the last message, so the state that counts is the one before it.
-        const prevIndex = (type === 'swipe' || type === 'continue') ? last - 1 : last;
-        // A new swipe is a new reply: nothing worked out for the old one may carry over to it.
-        if (type === 'swipe' && chat[last]) this.clearData(chat[last], 'sheet', 'edited', 'gate');
-        let sheet = null;
-        let stale = false;
-        if (s.timing === 'after') {
-            // No waiting before the reply: the notes are one message behind and say so.
-            // The newest message is folded in after the reply, when the reply is checked.
-            await this.lock;
-            sheet = this.sheetAt(prevIndex);
-            stale = Boolean(sheet) && !this.data(chat[prevIndex])?.sheet;
-        } else {
-            try {
-                sheet = await this.exclusive(() => this.ensureThrough(prevIndex));
-            } catch (error) {
-                // Old notes presented as current would contradict the newest message, so none are sent.
-                this.deps.status(`Could not update the scene notes, so this reply is written without them. ${reason(error)}`, 'error');
-            }
-        }
-        this.deps.inject(renderSheet(sheet, { stale }), this.memoryText(prevIndex));
-    }
-
-    /** Runs when a reply has arrived. Checks it, fixes it if needed, and records the new state. */
-    async afterReply(index, type = 'normal') {
-        const s = this.deps.settings();
-        if (!s.enabled || type === 'first_message' || type === 'impersonate') return;
-        const chat = this.deps.chat();
-        const message = chat[index];
-        if (!message || message.is_user || message.is_system || index !== chat.length - 1) return;
-        if (!String(message.mes ?? '').trim()) return;
-        try {
-            await this.exclusive(() => this.checkReply(index, type));
-        } catch (error) {
-            this.deps.status(`Could not check the reply, so it was left as written. ${reason(error)}`, 'error');
-        }
-        this.summarizeSoon();
-    }
-
-    async checkReply(index, type) {
-        const s = this.deps.settings();
-        const chatId = this.deps.chatId();
-        const message = this.deps.chat()[index];
-        if (type === 'continue') this.clearData(message, 'sheet', 'edited', 'gate');
-        if (this.data(message)?.sheet) return;
+        const message = chat[reply.index];
         const text = message.mes;
-        const swipe = message.swipe_id;
-        const stale = () => this.deps.chatId() !== chatId || this.deps.chat()[index] !== message || message.mes !== text || message.swipe_id !== swipe;
-
-        const prev = await this.ensureThrough(index - 1);
-        if (stale()) return;
-        if (!prev) {
-            // Nothing before this reply to compare it with: just start the record.
-            const sheet = await this.advance(null, Math.max(0, index - s.rebuildWindow + 1), index);
-            if (stale()) return;
-            this.setData(message, { sheet, gate: 'yes' });
-            await this.deps.persist(index, { rerender: false, save: true });
-            return;
-        }
-
-        let changed = true;
-        if (s.gateMode === 'local') {
-            try {
-                changed = await this.deps.gate(index);
-            } catch (error) {
-                console.warn('[Goldfish Therapy] local check failed, asking Claude instead:', reason(error));
-            }
-            if (stale()) return;
-        }
-        if (!changed) {
-            this.setData(message, { sheet: prev, gate: 'no' });
-            await this.deps.persist(index, { rerender: false, save: true });
-            this.deps.status('Nothing physical in that reply', 'ok');
-            return;
-        }
-
-        if (!s.fixReplies) {
+        const guard = this.guard(through, reply.index);
+        let sheet = prev;
+        if (this.list(known + 1, reply.index - 1).length) {
+            // Rare: something before the reply was never counted (a failed turn). Count it first.
             this.deps.status('Updating the scene notes…', 'busy');
-            const sheet = await this.advance(prev, index, index);
-            if (stale()) return;
-            this.setData(message, { sheet, gate: 'yes' });
-            await this.deps.persist(index, { rerender: false, save: true });
-            this.deps.status('Scene notes updated', 'ok');
-            return;
+            sheet = await this.advance(prev, known + 1, reply.index - 1);
+            if (guard.gone()) return null;
+            this.setData(chat[reply.index - 1], { sheet, gate: 'yes' });
         }
 
-        this.deps.status('Checking the reply…', 'busy');
+        this.deps.status('Checking the last reply…', 'busy');
         const prompt = buildCheck({
             cast: this.deps.cast(),
-            sheet: prev,
-            context: this.list(index - CHECK_CONTEXT, index - 1),
-            reply: this.list(index, index)[0],
+            sheet,
+            context: this.list(reply.index - CHECK_CONTEXT, reply.index - 1),
+            reply: this.list(reply.index, reply.index)[0],
+            after: this.list(reply.index + 1, through),
         });
         const out = extractJson(await this.deps.claude({ ...prompt, label: 'reply check' }));
-        if (!out) throw new Error(`Claude did not return a usable answer. ${DECLINED}`);
-        if (stale()) return;
-        const sheet = normalizeSheet(out.sheet) ?? prev;
+        const next = normalizeSheet(out?.sheet);
+        if (!out || !next) throw new Error(`Claude did not return a usable answer. ${DECLINED}`);
+        if (guard.gone()) return null;
+
         const result = applyEdits(text, out.edits);
-        const patch = { sheet, gate: 'yes' };
+        const patch = { checked: true };
         if (result.applied.length) {
             patch.edited = { original: text, edits: result.applied };
             message.mes = result.text;
+            this.fixes.push({ index: reply.index, original: text, text: result.text, edits: result.applied });
         }
         this.setData(message, patch);
-        await this.deps.persist(index, { rerender: result.applied.length > 0, save: true });
+        accept();
+        this.setData(chat[through], { sheet: next, gate: 'yes' });
+        await this.deps.persist(reply.index, { rerender: result.applied.length > 0, save: true });
         if (result.skipped.length) console.warn('[Goldfish Therapy] edits not applied:', result.skipped);
         const n = result.applied.length;
-        this.deps.status(n ? `Fixed ${n} continuity slip${n === 1 ? '' : 's'} in that reply` : 'Reply is consistent', 'ok');
+        this.deps.status(n ? `Fixed ${n} continuity slip${n === 1 ? '' : 's'} in the last reply` : 'The last reply is consistent', 'ok');
+        return next;
+    }
+
+    // ---------- the hook ----------
+
+    /**
+     * Runs just before SillyTavern builds the prompt for a reply. This is the only moment the
+     * add-on works on the chat: the player has moved on, so everything already there is accepted.
+     * Returns { fixes }: the replies whose text was changed in time for this prompt.
+     */
+    async beforeGenerate(type) {
+        const s = this.deps.settings();
+        this.fixes = [];
+        if (!s.enabled) {
+            this.deps.inject('', '');
+            return { fixes: [] };
+        }
+        if (type === 'quiet' || type === 'impersonate') return { fixes: [] };
+        const chat = this.deps.chat();
+        const last = chat.length - 1;
+        // A swipe or a continue rewrites the last message: it is not accepted, and the state that
+        // counts is the one before it. Nothing worked out for its old text may carry over.
+        const redo = type === 'swipe' || type === 'continue';
+        const through = redo ? last - 1 : last;
+        if (redo && chat[last]) this.clearData(chat[last], 'sheet', 'edited', 'gate', 'checked');
+
+        let sheet = null;
+        let stale = false;
+        const failed = error => this.deps.status(`Could not check the last reply or update the scene notes, so nothing was changed. ${reason(error)}`, 'error');
+        try {
+            if (s.timing === 'after') {
+                // Do not wait for Claude: the reply starts from the notes as they were, marked as
+                // slightly old, and the check lands while the reply is being written.
+                const plan = await this.exclusive(() => this.triage(through));
+                if (plan.job) {
+                    sheet = this.sheetAt(through);
+                    stale = Boolean(sheet);
+                    this.exclusive(plan.job).catch(failed);
+                } else {
+                    sheet = plan.sheet;
+                }
+            } else {
+                sheet = await this.exclusive(async () => {
+                    const plan = await this.triage(through);
+                    return plan.job ? plan.job() : plan.sheet;
+                });
+            }
+        } catch (error) {
+            // Old notes presented as current would contradict the newest message, so none are sent.
+            sheet = null;
+            stale = false;
+            failed(error);
+        }
+        this.deps.inject(renderSheet(sheet, { stale }), this.memoryText(through));
+        if (!redo) this.summarizeSoon();
+        return { fixes: this.fixes };
     }
 
     // ---------- memory ----------
@@ -331,7 +389,12 @@ export class Engine {
     /** A message's text was edited by hand: what was worked out from it onward no longer holds. */
     async onEdited(index) {
         const chat = this.deps.chat();
-        if (chat[index]) this.clearData(chat[index], 'edited');
+        const message = chat[index];
+        if (message) {
+            this.clearData(message, 'edited');
+            // Text the player wrote over a reply is the player's: it is never "fixed".
+            if (!message.is_user && !message.is_system) this.setData(message, { checked: true });
+        }
         for (let i = index; i < chat.length; i++) this.clearData(chat[i], 'sheet', 'gate');
         await this.forgetMemoryFrom(index);
     }
@@ -348,7 +411,7 @@ export class Engine {
         await this.deps.saveMemory();
     }
 
-    /** Put a fixed reply back the way the local model wrote it. */
+    /** Put a fixed reply back the way the local model wrote it. It is not fixed a second time. */
     async restore(index) {
         const chat = this.deps.chat();
         const message = chat[index];
@@ -356,6 +419,7 @@ export class Engine {
         if (!edited) return false;
         message.mes = edited.original;
         this.clearData(message, 'edited');
+        this.setData(message, { checked: true });
         for (let i = index; i < chat.length; i++) this.clearData(chat[i], 'sheet', 'gate');
         await this.deps.persist(index, { rerender: true, save: true });
         return true;
@@ -365,16 +429,16 @@ export class Engine {
     correct(note) {
         return this.exclusive(async () => {
             const chat = this.deps.chat();
-            const last = chat.length - 1;
-            if (last < 0) return null;
+            const end = this.acceptedEnd();
+            if (end < 0) return null;
             const s = this.deps.settings();
-            const prev = this.sheetAt(last);
+            const prev = this.sheetAt(end);
             this.deps.status('Correcting the scene notes…', 'busy');
             const sheet = prev
-                ? await this.advance(prev, last + 1, last, note)
-                : await this.advance(null, Math.max(0, last - s.rebuildWindow + 1), last, note);
-            this.setData(chat[last], { sheet, gate: 'yes' });
-            await this.deps.persist(last, { rerender: false, save: true });
+                ? await this.advance(prev, end + 1, end, note)
+                : await this.advance(null, Math.max(0, end - s.rebuildWindow + 1), end, note);
+            this.setData(chat[end], { sheet, gate: 'yes' });
+            await this.deps.persist(end, { rerender: false, save: true });
             this.deps.status('Scene notes corrected', 'ok');
             return sheet;
         });
@@ -384,14 +448,14 @@ export class Engine {
     rebuild() {
         return this.exclusive(async () => {
             const chat = this.deps.chat();
-            const last = chat.length - 1;
-            if (last < 0) return null;
+            const end = this.acceptedEnd();
+            if (end < 0) return null;
             const s = this.deps.settings();
             for (const m of chat) this.clearData(m, 'sheet', 'gate');
             this.deps.status('Rebuilding the scene notes…', 'busy');
-            const sheet = await this.advance(null, Math.max(0, last - s.rebuildWindow + 1), last);
-            this.setData(chat[last], { sheet, gate: 'yes' });
-            await this.deps.persist(last, { rerender: false, save: true });
+            const sheet = await this.advance(null, Math.max(0, end - s.rebuildWindow + 1), end);
+            this.setData(chat[end], { sheet, gate: 'yes' });
+            await this.deps.persist(end, { rerender: false, save: true });
             this.deps.status('Scene notes rebuilt', 'ok');
             return sheet;
         });

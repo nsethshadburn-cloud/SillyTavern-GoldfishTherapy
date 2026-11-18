@@ -10,14 +10,16 @@ Your local model still writes every reply. Claude only does the bookkeeping.
 
 ## How a turn goes
 
-1. You send a message.
-2. The local model answers one word, YES or NO: did anything physical happen in it? (About 0.3 seconds.)
-3. On YES, Claude updates the scene notes. On NO, the notes stay as they are and Claude is not called.
-4. The local model writes its reply with the notes and the memory in its prompt.
-5. The same one-word check runs on the reply. On YES, Claude checks the reply against the notes, fixes it if needed, and updates the notes.
-6. In the background, once enough messages have piled up, Claude writes a memory of the older ones.
+A fresh reply is never touched. Read it, swipe it, edit it, delete it: nothing happens. A reply counts as accepted when you send your next message, and that is the only moment the add-on works:
 
-A small line above the message box shows what it is doing. A reply that was changed gets a **✂ fixed** tag next to the name: click it to see what changed and why, and to put the original back.
+1. You send a message.
+2. The local model answers one word, YES or NO, about the reply you just accepted and about your message: did anything physical happen in it? (About 0.3 seconds each.)
+3. If both are NO, the notes stay as they are and Claude is not called.
+4. Otherwise one Claude call does everything: it checks the accepted reply against the notes, fixes it if needed, and brings the notes up to date with the reply and your message. If you went along with something the reply made up (you took the pencil it invented), it stays: your message is the truth of the story.
+5. The local model writes its next reply from the fixed text, the notes and the memory.
+6. Meanwhile, once enough messages have piled up, Claude writes a memory of the older ones.
+
+While it works, a thin line of light sweeps along the top edge of the message box and fades when it is done. A reply that was changed pulses once and gets a small **✂ fixed** tag next to the name: click it to see what changed and why, and to put the original back. The panel shows what it last did.
 
 ## Install
 
@@ -44,7 +46,7 @@ Extensions panel, **Goldfish Therapy**.
 |---|---|
 | On | Master switch. |
 | When to ask Claude | *Only when the local model says something physical happened* is the default. *On every message* skips the local check. |
-| When your message changes something physical | *Update the notes first* is the default and the most accurate: the reply waits a few seconds for Claude. *Write the reply right away* removes the wait; the notes then run one message behind and say so, and catch up after the reply. |
+| When you send a message and Claude is needed | *Wait for Claude* is the default and the most accurate: the next reply is written from the fixed text and current notes, a few seconds later. *Start the reply right away* removes the wait: the fix and the notes land while the reply is being written, so they only help from the following turn on. |
 | Fix continuity slips in replies | Off means the notes are still kept and shown to the model, but replies are never edited. |
 | Claude model | `claude-haiku-5-5` by default. |
 | Write a memory every N messages | Default 12. The newest 6 messages are never summarized. |
@@ -59,7 +61,8 @@ Measured on a 26B local model on KoboldCpp and `claude-haiku-5-5`:
 
 - The local one-word check takes about 0.3 seconds and does not disturb KoboldCpp's cache. It is sent as a continuation of the prompt the last reply was written from, so only the new message is new.
 - A Claude call takes 2.5 to 5 seconds.
-- With the default settings, a message of yours that changes something physical delays the reply by one Claude call. Talk-only messages do not. The check on the reply happens after the reply is on screen.
+- With the default settings, sending a message delays the next reply by one Claude call when the reply before it or your message had something physical in it. A turn that is only talk is not delayed. There is at most one such call per turn, plus the memory call every so many messages, which never holds anything up.
+- Swiping costs nothing: a swipe is written from the notes as they stood before the reply, and no model is asked anything.
 - 14 Claude calls in testing cost under one cent. The panel shows a running estimate for the month.
 
 In testing the local check got 47 of 52 messages right and never said NO to a physical one. Its mistakes are extra YES answers, which cost one small Claude call each.
@@ -67,8 +70,9 @@ In testing the local check got 47 of 52 messages right and never said NO to a ph
 ## What it does not do
 
 - It does not stop the model repeating itself or arguing in circles. That is not a state problem.
-- It fixes a reply after it is on screen. If text-to-speech starts reading the moment a reply arrives, it reads the unfixed version.
-- If Claude declines a message or the call fails, the reply is left exactly as written and a red note says so. Nothing is retried in a loop. The next turn picks the missed message up.
+- It fixes a reply only after you have moved on from it. What you read first, and what text-to-speech reads, is always the reply as the model wrote it.
+- It does not fix a reply you edited by hand, or one you put back with *Put the original back*.
+- If Claude declines a message or the call fails, nothing is changed and a red notice says so. Nothing is retried in a loop. The next turn picks the missed reply up.
 - It only reads what the chat says. If the notes are wrong, correct them in the panel.
 
 ## One thing to check in SillyTavern itself

@@ -68,9 +68,13 @@ Reply with JSON only: {"sheet": { ... }}`;
     return { system, user: parts.join('\n\n') };
 }
 
-/** Check one reply from the AI-written character against the sheet, fix it, and update the sheet. */
-export function buildCheck({ cast, sheet, context, reply }) {
-    const system = `You are the continuity editor for a roleplay between a human player and an AI-written character (${cast.charName}). A small local model writes ${cast.charName}'s replies and it loses track of physical facts. You check its newest reply against the record and repair it with the smallest possible edits. You never judge the story's content or style.
+/**
+ * Check one reply from the AI-written character against the sheet, fix it, and update the sheet.
+ * `after` holds the messages that followed the reply (usually the player's next one): they are
+ * never edited, only folded into the sheet.
+ */
+export function buildCheck({ cast, sheet, context, reply, after = [] }) {
+    const system = `You are the continuity editor for a roleplay between a human player and an AI-written character (${cast.charName}). A small local model writes ${cast.charName}'s replies and it loses track of physical facts. You check one of its replies against the record and repair it with the smallest possible edits. You never judge the story's content or style.
 
 WHAT COUNTS AS AN ERROR
 1. Impossible action: the reply has someone do what their state on the sheet rules out (using hands that are tied behind the back, walking with bound legs, speaking clearly through a gag).
@@ -88,18 +92,25 @@ HOW TO EDIT
 - "why" is one short plain sentence for the player.
 - If the reply is consistent, return an empty edits list. Most replies need no edit.
 
+MESSAGES AFTER THE REPLY
+Sometimes the messages that came after the reply are shown too. They are already part of the story. Never edit them and never put text from them in "find".
+- Judge the reply only against the sheet and what came before it, never against what comes after.
+- If a later message from the player goes along with something in the reply (uses the object, answers the action, builds on it), the player has accepted it: it is part of the story now. Do not edit it out; record it on the sheet.
+- The sheet you return is the state after the LAST message shown, so fold the later messages in.
+
 ${SHEET_FORMAT}
 
 ${SHEET_RULES}
 
 Reply with JSON only:
-{"edits": [{"find": "...", "replace": "...", "why": "..."}], "sheet": { the sheet as it stands after the reply, with your edits applied }}`;
+{"edits": [{"find": "...", "replace": "...", "why": "..."}], "sheet": { the sheet as it stands after the last message shown, with your edits applied }}`;
     const parts = [
         castBlock(cast),
         `SHEET (true before the reply):\n${JSON.stringify(sheet)}`,
     ];
     if (context.length) parts.push(`RECENT MESSAGES (already counted in the sheet):\n${transcript(context)}`);
     parts.push(`THE REPLY TO CHECK:\n${transcript([reply])}`);
+    if (after.length) parts.push(`MESSAGES AFTER THE REPLY (not to be edited, only folded into the sheet):\n${transcript(after)}`);
     return { system, user: parts.join('\n\n') };
 }
 

@@ -1,43 +1,96 @@
 /* Goldfish Therapy */
 
+/* The activity line: a hairline of light on the top edge of the message box. Takes no room. */
+
 #gft_status {
-    display: none;
-    font-size: 0.8em;
-    padding: 2px 10px;
-    opacity: 0.85;
-    color: var(--SmartThemeBodyColor);
-    background: var(--SmartThemeBlurTintColor);
-    border-radius: 8px 8px 0 0;
-    width: fit-content;
-    max-width: 100%;
+    --gft-light: var(--SmartThemeQuoteColor, #e8a23a);
+    position: relative;
+    height: 0;
+    pointer-events: none;
 }
 
-#gft_status.gft-show {
-    display: block;
+#gft_status > span {
+    position: absolute;
+    left: 6%;
+    right: 6%;
+    bottom: 0;
+    height: 2px;
+    border-radius: 2px;
+    opacity: 0;
+    transition: opacity 0.7s ease;
+    background-image: linear-gradient(90deg, transparent, var(--gft-light), transparent);
+    background-repeat: no-repeat;
+    background-size: 100% 100%;
+    filter: drop-shadow(0 0 3px var(--gft-light));
+}
+
+#gft_status.gft-show > span {
+    opacity: 0.75;
+}
+
+#gft_status[data-kind="busy"] > span {
+    background-size: 45% 100%;
+    animation: gft-sweep 1.7s ease-in-out infinite;
 }
 
 #gft_status[data-kind="error"] {
-    color: #ff8a8a;
+    --gft-light: #ff6b6b;
 }
 
-#gft_status[data-kind="busy"] {
-    font-style: italic;
+#gft_status[data-kind="warn"] {
+    --gft-light: #e0a030;
+}
+
+@keyframes gft-sweep {
+    from { background-position: -90% 0; }
+    to { background-position: 190% 0; }
+}
+
+/* A reply that was just fixed: one soft pulse, so the change reads as deliberate. */
+
+#chat .mes.gft-glow {
+    animation: gft-glow 2.2s ease-out 1;
+}
+
+@keyframes gft-glow {
+    0% { box-shadow: inset 0 0 0 0 transparent; }
+    20% { box-shadow: inset 3px 0 0 0 var(--SmartThemeQuoteColor, #e8a23a); }
+    100% { box-shadow: inset 0 0 0 0 transparent; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    #gft_status[data-kind="busy"] > span {
+        animation: none;
+        background-size: 100% 100%;
+    }
+
+    #chat .mes.gft-glow {
+        animation: none;
+    }
 }
 
 .gft-badge {
     cursor: pointer;
-    font-size: 0.7em;
+    font-size: 0.68em;
     margin-left: 8px;
-    padding: 1px 6px;
-    border-radius: 8px;
-    border: 1px solid var(--SmartThemeBorderColor);
-    opacity: 0.7;
+    opacity: 0.4;
     white-space: nowrap;
     align-self: center;
+    transition: opacity 0.2s ease;
 }
 
 .gft-badge:hover {
     opacity: 1;
+}
+
+#gft_last[data-kind="error"] {
+    color: #ff8a8a;
+    opacity: 1;
+}
+
+#gft_pending:empty,
+#gft_last:empty {
+    display: none;
 }
 
 .gft-panel label {

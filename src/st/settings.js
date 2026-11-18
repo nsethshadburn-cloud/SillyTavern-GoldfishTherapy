@@ -7,7 +7,7 @@ export const DEFAULTS = Object.freeze({
     model: 'claude-haiku-5-5',
     profileId: '',          // which saved Claude connection to borrow the key from ('' = the first Claude one)
     gateMode: 'local',      // 'local' = the local model decides when Claude is needed; 'always' = Claude sees every message
-    timing: 'before',       // 'before' = notes are brought up to date before the reply is written; 'after' = no wait, notes run one message behind
+    timing: 'before',       // when a message is sent and Claude is needed: 'before' = wait for it, then write the reply; 'after' = start the reply at once, the fix and notes land meanwhile
     fixReplies: true,
     interval: 12,           // summarize once this many messages are old enough
     keepRecent: 6,          // the newest messages are never summarized

@@ -1,6 +1,6 @@
 {
     "name": "sillytavern-goldfish-therapy",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "description": "SillyTavern add-on: keeps the physical state of the scene straight, remembers the story, and fixes continuity slips in replies.",
     "type": "module",
     "private": true,

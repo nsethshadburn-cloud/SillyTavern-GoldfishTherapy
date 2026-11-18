@@ -6,6 +6,7 @@ import { localGate, callClaude, expectChatPrompt, forgetChatPrompt, onCombinePro
 import { Engine } from '../core/engine.js';
 import { normalizeMemory, renderMemory, emptyMemory } from '../core/memory.js';
 import { renderSheet } from '../core/sheet.js';
+import { applyEdits } from '../core/edits.js';
 
 const SHEET_KEY = 'goldfish_therapy_sheet';
 const MEMORY_KEY = 'goldfish_therapy_memory';
@@ -49,31 +50,88 @@ async function persist(index, { rerender, save: saveNow }) {
     const message = ST.chat[index];
     if (!message) return;
     ST.syncMesToSwipe(index);
-    if (rerender) ST.updateMessageBlock(index, message);
-    // While a reply is still being finished, SillyTavern saves the chat itself right after our hook.
+    if (rerender) {
+        ST.updateMessageBlock(index, message);
+        glow(index);
+    }
+    // While a reply is being written, SillyTavern saves the chat itself when the reply is done.
     if (saveNow && !ST.isBusy) await ST.saveChat();
     refreshBadges();
 }
 
-// ---------------- status line ----------------
+/** A soft pulse on a reply whose text was just fixed, so the change does not look like a glitch. */
+function glow(index) {
+    const el = document.querySelector(`#chat .mes[mesid="${index}"]`);
+    if (!el) return;
+    el.classList.remove('gft-glow');
+    void el.offsetWidth;
+    el.classList.add('gft-glow');
+    setTimeout(() => el.classList.remove('gft-glow'), 2200);
+}
+
+/**
+ * SillyTavern hands add-ons copies of the messages for the prompt it is about to build, made before
+ * our hook runs. A reply fixed inside the hook has to be fixed in its copy too, or the model would
+ * still be shown the unfixed text this turn.
+ */
+function patchPromptCopies(copies, fixes) {
+    if (!Array.isArray(copies)) return;
+    for (const fix of fixes) {
+        const source = ST.chat[fix.index];
+        if (!source) continue;
+        let copy = null;
+        for (let i = copies.length - 1; i >= 0 && !copy; i--) {
+            const c = copies[i];
+            if (!c || c.is_user) continue;
+            if ((c.extra && c.extra === source.extra) || (c.send_date === source.send_date && c.name === source.name)) copy = c;
+        }
+        if (!copy) {
+            console.warn(`[${NAME}] the fixed reply was not found among the prompt messages; this one prompt uses the unfixed text`);
+            continue;
+        }
+        copy.mes = copy.mes === fix.original ? fix.text : applyEdits(copy.mes, fix.edits).text;
+    }
+}
+
+// ---------------- the activity line ----------------
+//
+// A hairline of light on the top edge of the message box: it sweeps while something is being
+// worked out and fades when it is done. No text. What it last did is written in the panel.
+// A failure also raises SillyTavern's own red notice, because a failure must not go unseen.
 
 let statusTimer = null;
+let lastStatus = null;
 
 function status(text, kind) {
     let el = document.getElementById('gft_status');
     if (!el) {
         el = document.createElement('div');
         el.id = 'gft_status';
+        el.setAttribute('aria-hidden', 'true');
+        el.appendChild(document.createElement('span'));
         (document.getElementById('form_sheld') ?? document.body).prepend(el);
     }
-    el.textContent = `🐟 ${text}`;
     el.dataset.kind = kind;
     el.classList.add('gft-show');
     clearTimeout(statusTimer);
-    if (kind !== 'busy') statusTimer = setTimeout(() => el.classList.remove('gft-show'), kind === 'error' ? 12000 : 3500);
+    if (kind !== 'busy') statusTimer = setTimeout(() => el.classList.remove('gft-show'), kind === 'error' ? 6000 : 700);
     if (kind === 'error') toastr.error(text, NAME, { timeOut: 12000 });
     if (kind === 'warn') console.warn(`[${NAME}] ${text}`);
+    lastStatus = { text, kind, at: new Date() };
     if (kind !== 'busy') refreshPanel();
+    else refreshLast();
+}
+
+function refreshLast() {
+    const el = document.getElementById('gft_last');
+    if (!el) return;
+    if (!lastStatus) {
+        el.textContent = '';
+        return;
+    }
+    const time = lastStatus.at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    el.textContent = `Last activity (${time}): ${lastStatus.text}`;
+    el.dataset.kind = lastStatus.kind;
 }
 
 // ---------------- the "fixed" badge on edited replies ----------------
@@ -140,10 +198,10 @@ const PANEL = `
         <option value="always">On every message (most thorough)</option>
       </select>
 
-      <label for="gft_timing">When your message changes something physical</label>
+      <label for="gft_timing" title="Nothing is touched while a reply is fresh. When you send your next message, the reply before it is checked and the notes are brought up to date.">When you send a message and Claude is needed</label>
       <select id="gft_timing" class="text_pole">
-        <option value="before">Update the notes first, then write the reply (most accurate, adds a few seconds)</option>
-        <option value="after">Write the reply right away, update the notes after (no wait, notes run one message behind)</option>
+        <option value="before">Wait for Claude, then write the reply (most accurate, adds a few seconds)</option>
+        <option value="after">Start the reply right away (no wait; the fix and the notes land while it is being written, so they help from the next turn on)</option>
       </select>
 
       <label class="checkbox_label" title="When a reply contradicts the scene notes or makes something up, Claude edits just that part. The original is kept and can be put back.">
@@ -161,6 +219,7 @@ const PANEL = `
 
       <h4>Scene notes right now</h4>
       <pre id="gft_sheet" class="gft-box"></pre>
+      <div id="gft_pending" class="gft-spend"></div>
       <div class="gft-row">
         <input id="gft_correction" class="text_pole" type="text" placeholder="Wrong? Say what is true, e.g. she is not tied up any more">
         <div class="menu_button gft-btn" id="gft_correct">Correct</div>
@@ -176,6 +235,7 @@ const PANEL = `
         <div class="menu_button gft-btn" id="gft_forget" title="Delete this chat's memory. The chat itself is not touched.">Forget this chat's memory</div>
       </div>
 
+      <div id="gft_last" class="gft-spend"></div>
       <div id="gft_spend" class="gft-spend"></div>
     </div>
   </div>
@@ -187,6 +247,9 @@ function refreshPanel() {
     const last = ST.chat.length - 1;
     const sheet = last >= 0 ? engine.sheetAt(last) : null;
     $('#gft_sheet').text(sheet ? renderSheet(sheet) : 'No notes yet. They are written when the next message is sent.');
+    const fresh = last > 0 && engine.unchecked(ST.chat[last]);
+    $('#gft_pending').text(fresh && sheet ? 'The newest reply is not counted yet. It is checked and added when you send your next message.' : '');
+    refreshLast();
     const mem = memory();
     $('#gft_memory').text(renderMemory(mem, '', 1e9) || 'Nothing yet. The first memory is written once the chat is long enough.');
 
@@ -276,7 +339,8 @@ export async function start() {
     globalThis.goldfishTherapyInterceptor = async function (_chat, _contextSize, _abort, type) {
         const kind = type || 'normal';
         try {
-            await engine.beforeGenerate(kind);
+            const { fixes } = await engine.beforeGenerate(kind);
+            patchPromptCopies(_chat, fixes);
         } catch (error) {
             console.error(`[${NAME}] before-generate hook failed`, error);
         }
@@ -289,10 +353,8 @@ export async function start() {
     const E = ST.eventTypes;
     on(E.GENERATE_AFTER_COMBINE_PROMPTS, onCombinePrompts);
     on(E.TEXT_COMPLETION_SETTINGS_READY, onTextGenSettings);
-    on(E.MESSAGE_RECEIVED, async (index, type) => {
-        await engine.afterReply(Number(index), type || 'normal');
-        refreshBadges();
-    });
+    // A fresh reply is left alone: it is only looked at once the player sends the next message.
+    on(E.MESSAGE_RECEIVED, () => setTimeout(refreshAll, 50));
     on(E.MESSAGE_EDITED, index => engine.onEdited(Number(index)).then(refreshAll));
     on(E.MESSAGE_DELETED, length => engine.onDeleted(Number(length)).then(refreshAll));
     on(E.CHAT_CHANGED, () => {

@@ -110,6 +110,9 @@ test('prompts carry the sheet, the cast and the reply', () => {
     assert.match(check.system, /continuity editor/);
     assert.match(check.user, /wrists tied/);
     assert.match(check.user, /\[#4 Mira \(character\)\]\nShe waves\./);
+    assert.doesNotMatch(check.user, /MESSAGES AFTER THE REPLY/);
+    const withNext = buildCheck({ cast, sheet, context: [], reply: { index: 4, name: 'Mira', isUser: false, text: 'She waves.' }, after: [{ index: 5, name: 'Tom', isUser: true, text: 'He waves back.' }] });
+    assert.match(withNext.user, /THE REPLY TO CHECK:[\s\S]*MESSAGES AFTER THE REPLY[\s\S]*\[#5 Tom \(player\)\]\nHe waves back\./);
     const advance = buildAdvance({ cast, sheet: null, context: [], messages: [{ index: 0, name: 'Tom', isUser: true, text: 'He unties her.' }] });
     assert.match(advance.user, /There is no sheet yet/);
     assert.match(advance.user, /\[#0 Tom \(player\)\]/);
